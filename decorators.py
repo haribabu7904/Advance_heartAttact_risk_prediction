@@ -1,305 +1,191 @@
-"""
-Define @jit and related decorators.
-"""
+from warnings import warn
+from numba.core import types, config, sigutils
+from numba.core.errors import DeprecationError, NumbaInvalidConfigWarning
+from numba.cuda.compiler import declare_device_function
+from numba.cuda.dispatcher import CUDADispatcher
+from numba.cuda.simulator.kernel import FakeCUDAKernel
 
-
-import sys
-import warnings
-import inspect
-import logging
-from types import MappingProxyType
-
-from numba.core.errors import DeprecationError, NumbaDeprecationWarning
-from numba.stencils.stencil import stencil
-from numba.core import config, extending, sigutils, registry
-
-_logger = logging.getLogger(__name__)
-
-
-# -----------------------------------------------------------------------------
-# Decorators
 
 _msg_deprecated_signature_arg = ("Deprecated keyword argument `{0}`. "
                                  "Signatures should be passed as the first "
                                  "positional argument.")
 
 
-def jit(signature_or_function=None, locals=MappingProxyType({}), cache=False,
-        pipeline_class=None, boundscheck=None, **options):
+def jit(func_or_sig=None, device=False, inline=False, link=None, debug=None,
+        opt=True, lineinfo=False, cache=False, **kws):
     """
-    This decorator is used to compile a Python function into native code.
+    JIT compile a Python function for CUDA GPUs.
 
-    Args
-    -----
-    signature_or_function:
-        The (optional) signature or list of signatures to be compiled.
-        If not passed, required signatures will be compiled when the
-        decorated function is called, depending on the argument values.
-        As a convenience, you can directly pass the function to be compiled
-        instead.
+    :param func_or_sig: A function to JIT compile, or *signatures* of a
+       function to compile. If a function is supplied, then a
+       :class:`Dispatcher <numba.cuda.dispatcher.CUDADispatcher>` is returned.
+       Otherwise, ``func_or_sig`` may be a signature or a list of signatures,
+       and a function is returned. The returned function accepts another
+       function, which it will compile and then return a :class:`Dispatcher
+       <numba.cuda.dispatcher.CUDADispatcher>`. See :ref:`jit-decorator` for
+       more information about passing signatures.
 
-    locals: dict
-        Mapping of local variable names to Numba types. Used to override the
-        types deduced by Numba's type inference engine.
-
-    pipeline_class: type numba.compiler.CompilerBase
-            The compiler pipeline type for customizing the compilation stages.
-
-    options:
-        For a cpu target, valid options are:
-            nopython: bool
-                Set to True to disable the use of PyObjects and Python API
-                calls. The default behavior is to allow the use of PyObjects
-                and Python API. Default value is True.
-
-            forceobj: bool
-                Set to True to force the use of PyObjects for every value.
-                Default value is False.
-
-            looplift: bool
-                Set to True to enable jitting loops in nopython mode while
-                leaving surrounding code in object mode. This allows functions
-                to allocate NumPy arrays and use Python objects, while the
-                tight loops in the function can still be compiled in nopython
-                mode. Any arrays that the tight loop uses should be created
-                before the loop is entered. Default value is True.
-
-            error_model: str
-                The error-model affects divide-by-zero behavior.
-                Valid values are 'python' and 'numpy'. The 'python' model
-                raises exception.  The 'numpy' model sets the result to
-                *+/-inf* or *nan*. Default value is 'python'.
-
-            inline: str or callable
-                The inline option will determine whether a function is inlined
-                at into its caller if called. String options are 'never'
-                (default) which will never inline, and 'always', which will
-                always inline. If a callable is provided it will be called with
-                the call expression node that is requesting inlining, the
-                caller's IR and callee's IR as arguments, it is expected to
-                return Truthy as to whether to inline.
-                NOTE: This inlining is performed at the Numba IR level and is in
-                no way related to LLVM inlining.
-
-            boundscheck: bool or None
-                Set to True to enable bounds checking for array indices. Out
-                of bounds accesses will raise IndexError. The default is to
-                not do bounds checking. If False, bounds checking is disabled,
-                out of bounds accesses can produce garbage results or segfaults.
-                However, enabling bounds checking will slow down typical
-                functions, so it is recommended to only use this flag for
-                debugging. You can also set the NUMBA_BOUNDSCHECK environment
-                variable to 0 or 1 to globally override this flag. The default
-                value is None, which under normal execution equates to False,
-                but if debug is set to True then bounds checking will be
-                enabled.
-
-    Returns
-    --------
-    A callable usable as a compiled function.  Actual compiling will be
-    done lazily if no explicit signatures are passed.
-
-    Examples
-    --------
-    The function can be used in the following ways:
-
-    1) jit(signatures, **targetoptions) -> jit(function)
-
-        Equivalent to:
-
-            d = dispatcher(function, targetoptions)
-            for signature in signatures:
-                d.compile(signature)
-
-        Create a dispatcher object for a python function.  Then, compile
-        the function with the given signature(s).
-
-        Example:
-
-            @jit("int32(int32, int32)")
-            def foo(x, y):
-                return x + y
-
-            @jit(["int32(int32, int32)", "float32(float32, float32)"])
-            def bar(x, y):
-                return x + y
-
-    2) jit(function, **targetoptions) -> dispatcher
-
-        Create a dispatcher function object that specializes at call site.
-
-        Examples:
-
-            @jit
-            def foo(x, y):
-                return x + y
-
-            @jit(nopython=True)
-            def bar(x, y):
-                return x + y
-
+       .. note:: A kernel cannot have any return value.
+    :param device: Indicates whether this is a device function.
+    :type device: bool
+    :param link: A list of files containing PTX or CUDA C/C++ source to link
+       with the function
+    :type link: list
+    :param debug: If True, check for exceptions thrown when executing the
+       kernel. Since this degrades performance, this should only be used for
+       debugging purposes. If set to True, then ``opt`` should be set to False.
+       Defaults to False.  (The default value can be overridden by setting
+       environment variable ``NUMBA_CUDA_DEBUGINFO=1``.)
+    :param fastmath: When True, enables fastmath optimizations as outlined in
+       the :ref:`CUDA Fast Math documentation <cuda-fast-math>`.
+    :param max_registers: Request that the kernel is limited to using at most
+       this number of registers per thread. The limit may not be respected if
+       the ABI requires a greater number of registers than that requested.
+       Useful for increasing occupancy.
+    :param opt: Whether to compile from LLVM IR to PTX with optimization
+                enabled. When ``True``, ``-opt=3`` is passed to NVVM. When
+                ``False``, ``-opt=0`` is passed to NVVM. Defaults to ``True``.
+    :type opt: bool
+    :param lineinfo: If True, generate a line mapping between source code and
+       assembly code. This enables inspection of the source code in NVIDIA
+       profiling tools and correlation with program counter sampling.
+    :type lineinfo: bool
+    :param cache: If True, enables the file-based cache for this function.
+    :type cache: bool
     """
-    locals = dict(locals)
-    forceobj = options.get('forceobj', False)
-    if 'argtypes' in options:
-        raise DeprecationError(_msg_deprecated_signature_arg.format('argtypes'))
-    if 'restype' in options:
-        raise DeprecationError(_msg_deprecated_signature_arg.format('restype'))
-    nopython = options.get('nopython', None)
-    if nopython is not None:
-        assert type(nopython) is bool, "nopython option must be a bool"
-    if nopython is True and forceobj:
-        raise ValueError("Only one of 'nopython' or 'forceobj' can be True.")
-    target = options.pop('_target', 'cpu')
 
-    if nopython is False:
-        msg = ("The keyword argument 'nopython=False' was supplied. From "
-               "Numba 0.59.0 the default is True and supplying this argument "
-               "has no effect.")
-        warnings.warn(msg, NumbaDeprecationWarning)
-    # nopython is True by default since 0.59.0, but if `forceobj` is set
-    # `nopython` needs to set to False so that things like typing of args in the
-    # dispatcher layer continues to work.
-    if forceobj:
-        options['nopython'] = False
+    if link is None:
+        link = []
+    if link and config.ENABLE_CUDASIM:
+        raise NotImplementedError('Cannot link PTX in the simulator')
+
+    if kws.get('boundscheck'):
+        raise NotImplementedError("bounds checking is not supported for CUDA")
+
+    if kws.get('argtypes') is not None:
+        msg = _msg_deprecated_signature_arg.format('argtypes')
+        raise DeprecationError(msg)
+    if kws.get('restype') is not None:
+        msg = _msg_deprecated_signature_arg.format('restype')
+        raise DeprecationError(msg)
+    if kws.get('bind') is not None:
+        msg = _msg_deprecated_signature_arg.format('bind')
+        raise DeprecationError(msg)
+
+    debug = config.CUDA_DEBUGINFO_DEFAULT if debug is None else debug
+    fastmath = kws.get('fastmath', False)
+    extensions = kws.get('extensions', [])
+
+    if debug and opt:
+        msg = ("debug=True with opt=True (the default) "
+               "is not supported by CUDA. This may result in a crash"
+               " - set debug=False or opt=False.")
+        warn(NumbaInvalidConfigWarning(msg))
+
+    if debug and lineinfo:
+        msg = ("debug and lineinfo are mutually exclusive. Use debug to get "
+               "full debug info (this disables some optimizations), or "
+               "lineinfo for line info only with code generation unaffected.")
+        warn(NumbaInvalidConfigWarning(msg))
+
+    if device and kws.get('link'):
+        raise ValueError("link keyword invalid for device function")
+
+    if sigutils.is_signature(func_or_sig):
+        signatures = [func_or_sig]
+        specialized = True
+    elif isinstance(func_or_sig, list):
+        signatures = func_or_sig
+        specialized = False
     else:
-        options['nopython'] = True
+        signatures = None
 
-    options['boundscheck'] = boundscheck
+    if signatures is not None:
+        if config.ENABLE_CUDASIM:
+            def jitwrapper(func):
+                return FakeCUDAKernel(func, device=device, fastmath=fastmath)
+            return jitwrapper
 
-    # Handle signature
-    if signature_or_function is None:
-        # No signature, no function
-        pyfunc = None
-        sigs = None
-    elif isinstance(signature_or_function, list):
-        # A list of signatures is passed
-        pyfunc = None
-        sigs = signature_or_function
-    elif sigutils.is_signature(signature_or_function):
-        # A single signature is passed
-        pyfunc = None
-        sigs = [signature_or_function]
+        def _jit(func):
+            targetoptions = kws.copy()
+            targetoptions['debug'] = debug
+            targetoptions['lineinfo'] = lineinfo
+            targetoptions['link'] = link
+            targetoptions['opt'] = opt
+            targetoptions['fastmath'] = fastmath
+            targetoptions['device'] = device
+            targetoptions['extensions'] = extensions
+
+            disp = CUDADispatcher(func, targetoptions=targetoptions)
+
+            if cache:
+                disp.enable_caching()
+
+            for sig in signatures:
+                argtypes, restype = sigutils.normalize_signature(sig)
+
+                if restype and not device and restype != types.void:
+                    raise TypeError("CUDA kernel must have void return type.")
+
+                if device:
+                    from numba.core import typeinfer
+                    with typeinfer.register_dispatcher(disp):
+                        disp.compile_device(argtypes, restype)
+                else:
+                    disp.compile(argtypes)
+
+            disp._specialized = specialized
+            disp.disable_compile()
+
+            return disp
+
+        return _jit
     else:
-        # A function is passed
-        pyfunc = signature_or_function
-        sigs = None
+        if func_or_sig is None:
+            if config.ENABLE_CUDASIM:
+                def autojitwrapper(func):
+                    return FakeCUDAKernel(func, device=device,
+                                          fastmath=fastmath)
+            else:
+                def autojitwrapper(func):
+                    return jit(func, device=device, debug=debug, opt=opt,
+                               lineinfo=lineinfo, link=link, cache=cache, **kws)
 
-    dispatcher_args = {}
-    if pipeline_class is not None:
-        dispatcher_args['pipeline_class'] = pipeline_class
-    wrapper = _jit(sigs, locals=locals, target=target, cache=cache,
-                   targetoptions=options, **dispatcher_args)
-    if pyfunc is not None:
-        return wrapper(pyfunc)
-    else:
-        return wrapper
+            return autojitwrapper
+        # func_or_sig is a function
+        else:
+            if config.ENABLE_CUDASIM:
+                return FakeCUDAKernel(func_or_sig, device=device,
+                                      fastmath=fastmath)
+            else:
+                targetoptions = kws.copy()
+                targetoptions['debug'] = debug
+                targetoptions['lineinfo'] = lineinfo
+                targetoptions['opt'] = opt
+                targetoptions['link'] = link
+                targetoptions['fastmath'] = fastmath
+                targetoptions['device'] = device
+                targetoptions['extensions'] = extensions
+                disp = CUDADispatcher(func_or_sig, targetoptions=targetoptions)
 
+                if cache:
+                    disp.enable_caching()
 
-def _jit(sigs, locals, target, cache, targetoptions, **dispatcher_args):
-
-    from numba.core.target_extension import resolve_dispatcher_from_str
-    dispatcher = resolve_dispatcher_from_str(target)
-
-    def wrapper(func):
-        if extending.is_jitted(func):
-            raise TypeError(
-                "A jit decorator was called on an already jitted function "
-                f"{func}.  If trying to access the original python "
-                f"function, use the {func}.py_func attribute."
-            )
-
-        if not inspect.isfunction(func):
-            raise TypeError(
-                "The decorated object is not a function (got type "
-                f"{type(func)})."
-            )
-
-        if config.ENABLE_CUDASIM and target == 'cuda':
-            from numba import cuda
-            return cuda.jit(func)
-        if config.DISABLE_JIT and not target == 'npyufunc':
-            return func
-        disp = dispatcher(py_func=func, locals=locals,
-                          targetoptions=targetoptions,
-                          **dispatcher_args)
-        if cache:
-            disp.enable_caching()
-        if sigs is not None:
-            # Register the Dispatcher to the type inference mechanism,
-            # even though the decorator hasn't returned yet.
-            from numba.core import typeinfer
-            with typeinfer.register_dispatcher(disp):
-                for sig in sigs:
-                    disp.compile(sig)
-                disp.disable_compile()
-        return disp
-
-    return wrapper
+                return disp
 
 
-def njit(*args, **kws):
+def declare_device(name, sig):
     """
-    Equivalent to jit(nopython=True)
+    Declare the signature of a foreign function. Returns a descriptor that can
+    be used to call the function from a Python kernel.
 
-    See documentation for jit function/decorator for full description.
+    :param name: The name of the foreign function.
+    :type name: str
+    :param sig: The Numba signature of the function.
     """
-    if 'nopython' in kws:
-        warnings.warn('nopython is set for njit and is ignored', RuntimeWarning)
-    if 'forceobj' in kws:
-        warnings.warn('forceobj is set for njit and is ignored', RuntimeWarning)
-        del kws['forceobj']
-    kws.update({'nopython': True})
-    return jit(*args, **kws)
+    argtypes, restype = sigutils.normalize_signature(sig)
+    if restype is None:
+        msg = 'Return type must be provided for device declarations'
+        raise TypeError(msg)
 
-
-def cfunc(sig, locals=MappingProxyType({}), cache=False, pipeline_class=None, **options):
-    """
-    This decorator is used to compile a Python function into a C callback
-    usable with foreign C libraries.
-
-    Usage::
-        @cfunc("float64(float64, float64)", nopython=True, cache=True)
-        def add(a, b):
-            return a + b
-
-    """
-    locals = dict(locals)
-    sig = sigutils.normalize_signature(sig)
-
-    def wrapper(func):
-        from numba.core.ccallback import CFunc
-        additional_args = {}
-        if pipeline_class is not None:
-            additional_args['pipeline_class'] = pipeline_class
-        res = CFunc(func, sig, locals=locals, options=options, **additional_args)
-        if cache:
-            res.enable_caching()
-        res.compile()
-        return res
-
-    return wrapper
-
-
-def jit_module(**kwargs):
-    """ Automatically ``jit``-wraps functions defined in a Python module
-
-    Note that ``jit_module`` should only be called at the end of the module to
-    be jitted. In addition, only functions which are defined in the module
-    ``jit_module`` is called from are considered for automatic jit-wrapping.
-    See the Numba documentation for more information about what can/cannot be
-    jitted.
-
-    :param kwargs: Keyword arguments to pass to ``jit`` such as ``nopython``
-                   or ``error_model``.
-
-    """
-    # Get the module jit_module is being called from
-    frame = inspect.stack()[1]
-    module = inspect.getmodule(frame[0])
-    # Replace functions in module with jit-wrapped versions
-    for name, obj in module.__dict__.items():
-        if inspect.isfunction(obj) and inspect.getmodule(obj) == module:
-            _logger.debug("Auto decorating function {} from module {} with jit "
-                          "and options: {}".format(obj, module.__name__, kwargs))
-            module.__dict__[name] = jit(obj, **kwargs)
+    return declare_device_function(name, restype, argtypes)

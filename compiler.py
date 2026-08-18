@@ -1,813 +1,422 @@
-from collections import namedtuple
-import copy
-import warnings
-from numba.core.tracing import event
-
-from numba.core import (errors, interpreter, bytecode, postproc, config,
-                        callconv, cpu)
-from numba.parfors.parfor import ParforDiagnostics
-from numba.core.errors import CompilerError
-from numba.core.environment import lookup_environment
-
-from numba.core.compiler_machinery import PassManager
-
-from numba.core.untyped_passes import (ExtractByteCode, TranslateByteCode,
-                                       FixupArgs, IRProcessing, DeadBranchPrune,
-                                       RewriteSemanticConstants,
-                                       InlineClosureLikes, GenericRewrites,
-                                       WithLifting, InlineInlinables,
-                                       FindLiterallyCalls,
-                                       MakeFunctionToJitFunction,
-                                       CanonicalizeLoopExit,
-                                       CanonicalizeLoopEntry, LiteralUnroll,
-                                       ReconstructSSA, RewriteDynamicRaises,
-                                       LiteralPropagationSubPipelinePass,
-                                       )
-
-from numba.core.typed_passes import (NopythonTypeInference, AnnotateTypes,
-                                     NopythonRewrites, PreParforPass,
-                                     ParforPass, DumpParforDiagnostics,
-                                     IRLegalization, NoPythonBackend,
-                                     InlineOverloads, PreLowerStripPhis,
-                                     NativeLowering, NativeParforLowering,
-                                     NoPythonSupportedFeatureValidation,
-                                     ParforFusionPass, ParforPreLoweringPass
-                                     )
-
-from numba.core.object_mode_passes import (ObjectModeFrontEnd,
-                                           ObjectModeBackEnd)
-from numba.core.targetconfig import TargetConfig, Option, ConfigStack
+from llvmlite import ir
+from numba.core.typing.templates import ConcreteTemplate
+from numba.core import types, typing, funcdesc, config, compiler, sigutils
+from numba.core.compiler import (sanitize_compile_result_entries, CompilerBase,
+                                 DefaultPassBuilder, Flags, Option,
+                                 CompileResult)
+from numba.core.compiler_lock import global_compiler_lock
+from numba.core.compiler_machinery import (LoweringPass,
+                                           PassManager, register_pass)
+from numba.core.errors import NumbaInvalidConfigWarning
+from numba.core.typed_passes import (IRLegalization, NativeLowering,
+                                     AnnotateTypes)
+from warnings import warn
+from numba.cuda.api import get_current_device
+from numba.cuda.target import CUDACABICallConv
 
 
-class Flags(TargetConfig):
-    __slots__ = ()
+def _nvvm_options_type(x):
+    if x is None:
+        return None
 
-    enable_looplift = Option(
-        type=bool,
-        default=False,
-        doc="Enable loop-lifting",
-    )
-    enable_pyobject = Option(
-        type=bool,
-        default=False,
-        doc="Enable pyobject mode (in general)",
-    )
-    enable_pyobject_looplift = Option(
-        type=bool,
-        default=False,
-        doc="Enable pyobject mode inside lifted loops",
-    )
-    enable_ssa = Option(
-        type=bool,
-        default=True,
-        doc="Enable SSA",
-    )
-    force_pyobject = Option(
-        type=bool,
-        default=False,
-        doc="Force pyobject mode inside the whole function",
-    )
-    release_gil = Option(
-        type=bool,
-        default=False,
-        doc="Release GIL inside the native function",
-    )
-    no_compile = Option(
-        type=bool,
-        default=False,
-        doc="TODO",
-    )
-    debuginfo = Option(
-        type=bool,
-        default=False,
-        doc="TODO",
-    )
-    boundscheck = Option(
-        type=bool,
-        default=False,
-        doc="TODO",
-    )
-    forceinline = Option(
-        type=bool,
-        default=False,
-        doc="Force inlining of the function. Overrides _dbg_optnone.",
-    )
-    no_cpython_wrapper = Option(
-        type=bool,
-        default=False,
-        doc="TODO",
-    )
-    no_cfunc_wrapper = Option(
-        type=bool,
-        default=False,
-        doc="TODO",
-    )
-    auto_parallel = Option(
-        type=cpu.ParallelOptions,
-        default=cpu.ParallelOptions(False),
-        doc="""Enable automatic parallel optimization, can be fine-tuned by
-taking a dictionary of sub-options instead of a boolean, see parfor.py for
-detail""",
-    )
-    nrt = Option(
-        type=bool,
-        default=False,
-        doc="TODO",
-    )
-    no_rewrites = Option(
-        type=bool,
-        default=False,
-        doc="TODO",
-    )
-    error_model = Option(
-        type=str,
-        default="python",
-        doc="TODO",
-    )
-    fastmath = Option(
-        type=cpu.FastMathOptions,
-        default=cpu.FastMathOptions(False),
-        doc="TODO",
-    )
-    noalias = Option(
-        type=bool,
-        default=False,
-        doc="TODO",
-    )
-    inline = Option(
-        type=cpu.InlineOptions,
-        default=cpu.InlineOptions("never"),
-        doc="TODO",
-    )
+    else:
+        assert isinstance(x, dict)
+        return x
 
-    dbg_extend_lifetimes = Option(
-        type=bool,
-        default=False,
-        doc=("Extend variable lifetime for debugging. "
-             "This automatically turns on with debug=True."),
-    )
 
-    dbg_optnone = Option(
-        type=bool,
-        default=False,
-        doc=("Disable optimization for debug. "
-             "Equivalent to adding optnone attribute in the LLVM Function.")
+class CUDAFlags(Flags):
+    nvvm_options = Option(
+        type=_nvvm_options_type,
+        default=None,
+        doc="NVVM options",
     )
-
-    dbg_directives_only = Option(
-        type=bool,
-        default=False,
-        doc=("Make debug emissions directives-only. "
-             "Used when generating lineinfo.")
+    compute_capability = Option(
+        type=tuple,
+        default=None,
+        doc="Compute Capability",
     )
 
 
-DEFAULT_FLAGS = Flags()
-DEFAULT_FLAGS.nrt = True
+# The CUDACompileResult (CCR) has a specially-defined entry point equal to its
+# id.  This is because the entry point is used as a key into a dict of
+# overloads by the base dispatcher. The id of the CCR is the only small and
+# unique property of a CompileResult in the CUDA target (cf. the CPU target,
+# which uses its entry_point, which is a pointer value).
+#
+# This does feel a little hackish, and there are two ways in which this could
+# be improved:
+#
+# 1. We could change the core of Numba so that each CompileResult has its own
+#    unique ID that can be used as a key - e.g. a count, similar to the way in
+#    which types have unique counts.
+# 2. At some future time when kernel launch uses a compiled function, the entry
+#    point will no longer need to be a synthetic value, but will instead be a
+#    pointer to the compiled function as in the CPU target.
 
-
-CR_FIELDS = ["typing_context",
-             "target_context",
-             "entry_point",
-             "typing_error",
-             "type_annotation",
-             "signature",
-             "objectmode",
-             "lifted",
-             "fndesc",
-             "library",
-             "call_helper",
-             "environment",
-             "metadata",
-             # List of functions to call to initialize on unserialization
-             # (i.e cache load).
-             "reload_init",
-             "referenced_envs",
-             ]
-
-
-class CompileResult(namedtuple("_CompileResult", CR_FIELDS)):
-    """
-    A structure holding results from the compilation of a function.
-    """
-
-    __slots__ = ()
-
-    def _reduce(self):
-        """
-        Reduce a CompileResult to picklable components.
-        """
-        libdata = self.library.serialize_using_object_code()
-        # Make it (un)picklable efficiently
-        typeann = str(self.type_annotation)
-        fndesc = self.fndesc
-        # Those don't need to be pickled and may fail
-        fndesc.typemap = fndesc.calltypes = None
-        # Include all referenced environments
-        referenced_envs = self._find_referenced_environments()
-        return (libdata, self.fndesc, self.environment, self.signature,
-                self.objectmode, self.lifted, typeann, self.reload_init,
-                tuple(referenced_envs))
-
-    def _find_referenced_environments(self):
-        """Returns a list of referenced environments
-        """
-        mod = self.library._final_module
-        # Find environments
-        referenced_envs = []
-        for gv in mod.global_variables:
-            gvn = gv.name
-            if gvn.startswith("_ZN08NumbaEnv"):
-                env = lookup_environment(gvn)
-                if env is not None:
-                    if env.can_cache():
-                        referenced_envs.append(env)
-        return referenced_envs
-
-    @classmethod
-    def _rebuild(cls, target_context, libdata, fndesc, env,
-                 signature, objectmode, lifted, typeann,
-                 reload_init, referenced_envs):
-        if reload_init:
-            # Re-run all
-            for fn in reload_init:
-                fn()
-
-        library = target_context.codegen().unserialize_library(libdata)
-        cfunc = target_context.get_executable(library, fndesc, env)
-        cr = cls(target_context=target_context,
-                 typing_context=target_context.typing_context,
-                 library=library,
-                 environment=env,
-                 entry_point=cfunc,
-                 fndesc=fndesc,
-                 type_annotation=typeann,
-                 signature=signature,
-                 objectmode=objectmode,
-                 lifted=lifted,
-                 typing_error=None,
-                 call_helper=None,
-                 metadata=None,  # Do not store, arbitrary & potentially large!
-                 reload_init=reload_init,
-                 referenced_envs=referenced_envs,
-                 )
-
-        # Load Environments
-        for env in referenced_envs:
-            library.codegen.set_env(env.env_name, env)
-
-        return cr
-
+class CUDACompileResult(CompileResult):
     @property
-    def codegen(self):
-        return self.target_context.codegen()
-
-    def dump(self, tab=''):
-        print(f'{tab}DUMP {type(self).__name__} {self.entry_point}')
-        self.signature.dump(tab=tab + '  ')
-        print(f'{tab}END DUMP')
+    def entry_point(self):
+        return id(self)
 
 
-_LowerResult = namedtuple("_LowerResult", [
-    "fndesc",
-    "call_helper",
-    "cfunc",
-    "env",
-])
-
-
-def sanitize_compile_result_entries(entries):
-    keys = set(entries.keys())
-    fieldset = set(CR_FIELDS)
-    badnames = keys - fieldset
-    if badnames:
-        raise NameError(*badnames)
-    missing = fieldset - keys
-    for k in missing:
-        entries[k] = None
-    # Avoid keeping alive traceback variables
-    err = entries['typing_error']
-    if err is not None:
-        entries['typing_error'] = err.with_traceback(None)
-    return entries
-
-
-def compile_result(**entries):
+def cuda_compile_result(**entries):
     entries = sanitize_compile_result_entries(entries)
-    return CompileResult(**entries)
+    return CUDACompileResult(**entries)
 
 
-def run_frontend(func, inline_closures=False, emit_dels=False):
-    """
-    Run the compiler frontend over the given Python function, and return
-    the function's canonical Numba IR.
+@register_pass(mutates_CFG=True, analysis_only=False)
+class CUDABackend(LoweringPass):
 
-    If inline_closures is Truthy then closure inlining will be run
-    If emit_dels is Truthy the ir.Del nodes will be emitted appropriately
-    """
-    # XXX make this a dedicated Pipeline?
-    func_id = bytecode.FunctionIdentity.from_function(func)
-    interp = interpreter.Interpreter(func_id)
-    bc = bytecode.ByteCode(func_id=func_id)
-    func_ir = interp.interpret(bc)
-    if inline_closures:
-        from numba.core.inline_closurecall import InlineClosureCallPass
-        inline_pass = InlineClosureCallPass(func_ir, cpu.ParallelOptions(False),
-                                            {}, False)
-        inline_pass.run()
-    post_proc = postproc.PostProcessor(func_ir)
-    post_proc.run(emit_dels)
-    return func_ir
+    _name = "cuda_backend"
 
+    def __init__(self):
+        LoweringPass.__init__(self)
 
-class _CompileStatus(object):
-    """
-    Describes the state of compilation. Used like a C record.
-    """
-    __slots__ = ['fail_reason', 'can_fallback']
+    def run_pass(self, state):
+        """
+        Back-end: Packages lowering output in a compile result
+        """
+        lowered = state['cr']
+        signature = typing.signature(state.return_type, *state.args)
 
-    def __init__(self, can_fallback):
-        self.fail_reason = None
-        self.can_fallback = can_fallback
-
-    def __repr__(self):
-        vals = []
-        for k in self.__slots__:
-            vals.append("{k}={v}".format(k=k, v=getattr(self, k)))
-        return ', '.join(vals)
-
-
-class _EarlyPipelineCompletion(Exception):
-    """
-    Raised to indicate that a pipeline has completed early
-    """
-
-    def __init__(self, result):
-        self.result = result
-
-
-class StateDict(dict):
-    """
-    A dictionary that has an overloaded getattr and setattr to permit getting
-    and setting key/values through the use of attributes.
-    """
-
-    def __getattr__(self, attr):
-        try:
-            return self[attr]
-        except KeyError:
-            raise AttributeError(attr)
-
-    def __setattr__(self, attr, value):
-        self[attr] = value
-
-
-def _make_subtarget(targetctx, flags):
-    """
-    Make a new target context from the given target context and flags.
-    """
-    subtargetoptions = {}
-    if flags.debuginfo:
-        subtargetoptions['enable_debuginfo'] = True
-    if flags.boundscheck:
-        subtargetoptions['enable_boundscheck'] = True
-    if flags.nrt:
-        subtargetoptions['enable_nrt'] = True
-    if flags.auto_parallel:
-        subtargetoptions['auto_parallel'] = flags.auto_parallel
-    if flags.fastmath:
-        subtargetoptions['fastmath'] = flags.fastmath
-    error_model = callconv.create_error_model(flags.error_model, targetctx)
-    subtargetoptions['error_model'] = error_model
-
-    return targetctx.subtarget(**subtargetoptions)
-
-
-class CompilerBase(object):
-    """
-    Stores and manages states for the compiler
-    """
-
-    def __init__(self, typingctx, targetctx, library, args, return_type, flags,
-                 locals):
-        # Make sure the environment is reloaded
-        config.reload_config()
-        typingctx.refresh()
-        targetctx.refresh()
-
-        self.state = StateDict()
-
-        self.state.typingctx = typingctx
-        self.state.targetctx = _make_subtarget(targetctx, flags)
-        self.state.library = library
-        self.state.args = args
-        self.state.return_type = return_type
-        self.state.flags = flags
-        self.state.locals = locals
-
-        # Results of various steps of the compilation pipeline
-        self.state.bc = None
-        self.state.func_id = None
-        self.state.func_ir = None
-        self.state.lifted = None
-        self.state.lifted_from = None
-        self.state.typemap = None
-        self.state.calltypes = None
-        self.state.type_annotation = None
-        # holds arbitrary inter-pipeline stage meta data
-        self.state.metadata = {}
-        self.state.reload_init = []
-        # hold this for e.g. with_lifting, null out on exit
-        self.state.pipeline = self
-
-        # parfor diagnostics info, add to metadata
-        self.state.parfor_diagnostics = ParforDiagnostics()
-        self.state.metadata['parfor_diagnostics'] = \
-            self.state.parfor_diagnostics
-        self.state.metadata['parfors'] = {}
-
-        self.state.status = _CompileStatus(
-            can_fallback=self.state.flags.enable_pyobject
+        state.cr = cuda_compile_result(
+            typing_context=state.typingctx,
+            target_context=state.targetctx,
+            typing_error=state.status.fail_reason,
+            type_annotation=state.type_annotation,
+            library=state.library,
+            call_helper=lowered.call_helper,
+            signature=signature,
+            fndesc=lowered.fndesc,
         )
+        return True
 
-    def compile_extra(self, func):
-        self.state.func_id = bytecode.FunctionIdentity.from_function(func)
-        ExtractByteCode().run_pass(self.state)
 
-        self.state.lifted = ()
-        self.state.lifted_from = None
-        return self._compile_bytecode()
+@register_pass(mutates_CFG=False, analysis_only=False)
+class CreateLibrary(LoweringPass):
+    """
+    Create a CUDACodeLibrary for the NativeLowering pass to populate. The
+    NativeLowering pass will create a code library if none exists, but we need
+    to set it up with nvvm_options from the flags if they are present.
+    """
 
-    def compile_ir(self, func_ir, lifted=(), lifted_from=None):
-        self.state.func_id = func_ir.func_id
-        self.state.lifted = lifted
-        self.state.lifted_from = lifted_from
-        self.state.func_ir = func_ir
-        self.state.nargs = self.state.func_ir.arg_count
+    _name = "create_library"
 
-        FixupArgs().run_pass(self.state)
-        return self._compile_ir()
+    def __init__(self):
+        LoweringPass.__init__(self)
 
+    def run_pass(self, state):
+        codegen = state.targetctx.codegen()
+        name = state.func_id.func_qualname
+        nvvm_options = state.flags.nvvm_options
+        state.library = codegen.create_library(name, nvvm_options=nvvm_options)
+        # Enable object caching upfront so that the library can be serialized.
+        state.library.enable_object_caching()
+
+        return True
+
+
+class CUDACompiler(CompilerBase):
     def define_pipelines(self):
-        """Child classes override this to customize the pipelines in use.
-        """
-        raise NotImplementedError()
-
-    def _compile_core(self):
-        """
-        Populate and run compiler pipeline
-        """
-        with ConfigStack().enter(self.state.flags.copy()):
-            pms = self.define_pipelines()
-            for pm in pms:
-                pipeline_name = pm.pipeline_name
-                func_name = "%s.%s" % (self.state.func_id.modname,
-                                       self.state.func_id.func_qualname)
-
-                event("Pipeline: %s for %s" % (pipeline_name, func_name))
-                self.state.metadata['pipeline_times'] = {pipeline_name:
-                                                         pm.exec_times}
-                is_final_pipeline = pm == pms[-1]
-                res = None
-                try:
-                    pm.run(self.state)
-                    if self.state.cr is not None:
-                        break
-                except _EarlyPipelineCompletion as e:
-                    res = e.result
-                    break
-                except Exception as e:
-                    if not isinstance(e, errors.NumbaError):
-                        raise e
-                    self.state.status.fail_reason = e
-                    if is_final_pipeline:
-                        raise e
-            else:
-                raise CompilerError("All available pipelines exhausted")
-
-            # Pipeline is done, remove self reference to release refs to user
-            # code
-            self.state.pipeline = None
-
-            # organise a return
-            if res is not None:
-                # Early pipeline completion
-                return res
-            else:
-                assert self.state.cr is not None
-                return self.state.cr
-
-    def _compile_bytecode(self):
-        """
-        Populate and run pipeline for bytecode input
-        """
-        assert self.state.func_ir is None
-        return self._compile_core()
-
-    def _compile_ir(self):
-        """
-        Populate and run pipeline for IR input
-        """
-        assert self.state.func_ir is not None
-        return self._compile_core()
-
-
-class Compiler(CompilerBase):
-    """The default compiler
-    """
-
-    def define_pipelines(self):
-        if self.state.flags.force_pyobject:
-            # either object mode
-            return [DefaultPassBuilder.define_objectmode_pipeline(self.state),]
-        else:
-            # or nopython mode
-            return [DefaultPassBuilder.define_nopython_pipeline(self.state),]
-
-
-class DefaultPassBuilder(object):
-    """
-    This is the default pass builder, it contains the "classic" default
-    pipelines as pre-canned PassManager instances:
-      - nopython
-      - objectmode
-      - interpreted
-      - typed
-      - untyped
-      - nopython lowering
-    """
-    @staticmethod
-    def define_nopython_pipeline(state, name='nopython'):
-        """Returns an nopython mode pipeline based PassManager
-        """
-        # compose pipeline from untyped, typed and lowering parts
         dpb = DefaultPassBuilder
-        pm = PassManager(name)
-        untyped_passes = dpb.define_untyped_pipeline(state)
+        pm = PassManager('cuda')
+
+        untyped_passes = dpb.define_untyped_pipeline(self.state)
         pm.passes.extend(untyped_passes.passes)
 
-        typed_passes = dpb.define_typed_pipeline(state)
+        typed_passes = dpb.define_typed_pipeline(self.state)
         pm.passes.extend(typed_passes.passes)
 
-        lowering_passes = dpb.define_nopython_lowering_pipeline(state)
+        lowering_passes = self.define_cuda_lowering_pipeline(self.state)
         pm.passes.extend(lowering_passes.passes)
 
         pm.finalize()
-        return pm
+        return [pm]
 
-    @staticmethod
-    def define_nopython_lowering_pipeline(state, name='nopython_lowering'):
-        pm = PassManager(name)
+    def define_cuda_lowering_pipeline(self, state):
+        pm = PassManager('cuda_lowering')
         # legalise
-        pm.add_pass(NoPythonSupportedFeatureValidation,
-                    "ensure features that are in use are in a valid form")
         pm.add_pass(IRLegalization,
                     "ensure IR is legal prior to lowering")
-        # Annotate only once legalized
         pm.add_pass(AnnotateTypes, "annotate types")
+
         # lower
-        if state.flags.auto_parallel.enabled:
-            pm.add_pass(NativeParforLowering, "native parfor lowering")
-        else:
-            pm.add_pass(NativeLowering, "native lowering")
-        pm.add_pass(NoPythonBackend, "nopython mode backend")
-        pm.add_pass(DumpParforDiagnostics, "dump parfor diagnostics")
-        pm.finalize()
-        return pm
-
-    @staticmethod
-    def define_parfor_gufunc_nopython_lowering_pipeline(
-            state, name='parfor_gufunc_nopython_lowering'):
-        pm = PassManager(name)
-        # legalise
-        pm.add_pass(NoPythonSupportedFeatureValidation,
-                    "ensure features that are in use are in a valid form")
-        pm.add_pass(IRLegalization,
-                    "ensure IR is legal prior to lowering")
-        # Annotate only once legalized
-        pm.add_pass(AnnotateTypes, "annotate types")
-        # lower
-        if state.flags.auto_parallel.enabled:
-            pm.add_pass(NativeParforLowering, "native parfor lowering")
-        else:
-            pm.add_pass(NativeLowering, "native lowering")
-        pm.add_pass(NoPythonBackend, "nopython mode backend")
-        pm.finalize()
-        return pm
-
-    @staticmethod
-    def define_typed_pipeline(state, name="typed"):
-        """Returns the typed part of the nopython pipeline"""
-        pm = PassManager(name)
-        # typing
-        pm.add_pass(NopythonTypeInference, "nopython frontend")
-
-        # strip phis
-        pm.add_pass(PreLowerStripPhis, "remove phis nodes")
-
-        # optimisation
-        pm.add_pass(InlineOverloads, "inline overloaded functions")
-        if state.flags.auto_parallel.enabled:
-            pm.add_pass(PreParforPass, "Preprocessing for parfors")
-        if not state.flags.no_rewrites:
-            pm.add_pass(NopythonRewrites, "nopython rewrites")
-        if state.flags.auto_parallel.enabled:
-            pm.add_pass(ParforPass, "convert to parfors")
-            pm.add_pass(ParforFusionPass, "fuse parfors")
-            pm.add_pass(ParforPreLoweringPass, "parfor prelowering")
+        pm.add_pass(CreateLibrary, "create library")
+        pm.add_pass(NativeLowering, "native lowering")
+        pm.add_pass(CUDABackend, "cuda backend")
 
         pm.finalize()
         return pm
 
-    @staticmethod
-    def define_parfor_gufunc_pipeline(state, name="parfor_gufunc_typed"):
-        """Returns the typed part of the nopython pipeline"""
-        pm = PassManager(name)
-        assert state.func_ir
-        pm.add_pass(IRProcessing, "processing IR")
-        pm.add_pass(NopythonTypeInference, "nopython frontend")
-        pm.add_pass(ParforPreLoweringPass, "parfor prelowering")
 
-        pm.finalize()
-        return pm
+@global_compiler_lock
+def compile_cuda(pyfunc, return_type, args, debug=False, lineinfo=False,
+                 inline=False, fastmath=False, nvvm_options=None,
+                 cc=None):
+    if cc is None:
+        raise ValueError('Compute Capability must be supplied')
 
-    @staticmethod
-    def define_untyped_pipeline(state, name='untyped'):
-        """Returns an untyped part of the nopython pipeline"""
-        pm = PassManager(name)
-        if state.func_ir is None:
-            pm.add_pass(TranslateByteCode, "analyzing bytecode")
-            pm.add_pass(FixupArgs, "fix up args")
-        pm.add_pass(IRProcessing, "processing IR")
-        pm.add_pass(WithLifting, "Handle with contexts")
+    from .descriptor import cuda_target
+    typingctx = cuda_target.typing_context
+    targetctx = cuda_target.target_context
 
-        # inline closures early in case they are using nonlocal's
-        # see issue #6585.
-        pm.add_pass(InlineClosureLikes,
-                    "inline calls to locally defined closures")
+    flags = CUDAFlags()
+    # Do not compile (generate native code), just lower (to LLVM)
+    flags.no_compile = True
+    flags.no_cpython_wrapper = True
+    flags.no_cfunc_wrapper = True
 
-        # pre typing
-        if not state.flags.no_rewrites:
-            pm.add_pass(RewriteSemanticConstants, "rewrite semantic constants")
-            pm.add_pass(DeadBranchPrune, "dead branch pruning")
-            pm.add_pass(GenericRewrites, "nopython rewrites")
+    # Both debug and lineinfo turn on debug information in the compiled code,
+    # but we keep them separate arguments in case we later want to overload
+    # some other behavior on the debug flag. In particular, -opt=3 is not
+    # supported with debug enabled, and enabling only lineinfo should not
+    # affect the error model.
+    if debug or lineinfo:
+        flags.debuginfo = True
 
-        pm.add_pass(RewriteDynamicRaises, "rewrite dynamic raises")
+    if lineinfo:
+        flags.dbg_directives_only = True
 
-        # convert any remaining closures into functions
-        pm.add_pass(MakeFunctionToJitFunction,
-                    "convert make_function into JIT functions")
-        # inline functions that have been determined as inlinable and rerun
-        # branch pruning, this needs to be run after closures are inlined as
-        # the IR repr of a closure masks call sites if an inlinable is called
-        # inside a closure
-        pm.add_pass(InlineInlinables, "inline inlinable functions")
-        if not state.flags.no_rewrites:
-            pm.add_pass(DeadBranchPrune, "dead branch pruning")
-
-        pm.add_pass(FindLiterallyCalls, "find literally calls")
-        pm.add_pass(LiteralUnroll, "handles literal_unroll")
-
-        if state.flags.enable_ssa:
-            pm.add_pass(ReconstructSSA, "ssa")
-
-        if not state.flags.no_rewrites:
-            pm.add_pass(DeadBranchPrune, "dead branch pruning")
-
-        pm.add_pass(LiteralPropagationSubPipelinePass, "Literal propagation")
-
-        pm.finalize()
-        return pm
-
-    @staticmethod
-    def define_objectmode_pipeline(state, name='object'):
-        """Returns an object-mode pipeline based PassManager
-        """
-        pm = PassManager(name)
-        if state.func_ir is None:
-            pm.add_pass(TranslateByteCode, "analyzing bytecode")
-            pm.add_pass(FixupArgs, "fix up args")
-        else:
-            # Reaches here if it's a fallback from nopython mode.
-            # Strip the phi nodes.
-            pm.add_pass(PreLowerStripPhis, "remove phis nodes")
-        pm.add_pass(IRProcessing, "processing IR")
-
-        # The following passes are needed to adjust for looplifting
-        pm.add_pass(CanonicalizeLoopEntry, "canonicalize loop entry")
-        pm.add_pass(CanonicalizeLoopExit, "canonicalize loop exit")
-
-        pm.add_pass(ObjectModeFrontEnd, "object mode frontend")
-        pm.add_pass(InlineClosureLikes,
-                    "inline calls to locally defined closures")
-        # convert any remaining closures into functions
-        pm.add_pass(MakeFunctionToJitFunction,
-                    "convert make_function into JIT functions")
-        pm.add_pass(IRLegalization, "ensure IR is legal prior to lowering")
-        pm.add_pass(AnnotateTypes, "annotate types")
-        pm.add_pass(ObjectModeBackEnd, "object mode backend")
-        pm.finalize()
-        return pm
-
-
-def compile_extra(typingctx, targetctx, func, args, return_type, flags,
-                  locals, library=None, pipeline_class=Compiler):
-    """Compiler entry point
-
-    Parameter
-    ---------
-    typingctx :
-        typing context
-    targetctx :
-        target context
-    func : function
-        the python function to be compiled
-    args : tuple, list
-        argument types
-    return_type :
-        Use ``None`` to indicate void return
-    flags : numba.compiler.Flags
-        compiler flags
-    library : numba.codegen.CodeLibrary
-        Used to store the compiled code.
-        If it is ``None``, a new CodeLibrary is used.
-    pipeline_class : type like numba.compiler.CompilerBase
-        compiler pipeline
-    """
-    pipeline = pipeline_class(typingctx, targetctx, library,
-                              args, return_type, flags, locals)
-    return pipeline.compile_extra(func)
-
-
-def compile_ir(typingctx, targetctx, func_ir, args, return_type, flags,
-               locals, lifted=(), lifted_from=None, is_lifted_loop=False,
-               library=None, pipeline_class=Compiler):
-    """
-    Compile a function with the given IR.
-
-    For internal use only.
-    """
-
-    # This is a special branch that should only run on IR from a lifted loop
-    if is_lifted_loop:
-        # This code is pessimistic and costly, but it is a not often trodden
-        # path and it will go away once IR is made immutable. The problem is
-        # that the rewrite passes can mutate the IR into a state that makes
-        # it possible for invalid tokens to be transmitted to lowering which
-        # then trickle through into LLVM IR and causes RuntimeErrors as LLVM
-        # cannot compile it. As a result the following approach is taken:
-        # 1. Create some new flags that copy the original ones but switch
-        #    off rewrites.
-        # 2. Compile with 1. to get a compile result
-        # 3. Try and compile another compile result but this time with the
-        #    original flags (and IR being rewritten).
-        # 4. If 3 was successful, use the result, else use 2.
-
-        # create flags with no rewrites
-        norw_flags = copy.deepcopy(flags)
-        norw_flags.no_rewrites = True
-
-        def compile_local(the_ir, the_flags):
-            pipeline = pipeline_class(typingctx, targetctx, library,
-                                      args, return_type, the_flags, locals)
-            return pipeline.compile_ir(func_ir=the_ir, lifted=lifted,
-                                       lifted_from=lifted_from)
-
-        # compile with rewrites off, IR shouldn't be mutated irreparably
-        norw_cres = compile_local(func_ir.copy(), norw_flags)
-
-        # try and compile with rewrites on if no_rewrites was not set in the
-        # original flags, IR might get broken but we've got a CompileResult
-        # that's usable from above.
-        rw_cres = None
-        if not flags.no_rewrites:
-            # Suppress warnings in compilation retry
-            with warnings.catch_warnings():
-                warnings.simplefilter("ignore", errors.NumbaWarning)
-                try:
-                    rw_cres = compile_local(func_ir.copy(), flags)
-                except Exception:
-                    pass
-        # if the rewrite variant of compilation worked, use it, else use
-        # the norewrites backup
-        if rw_cres is not None:
-            cres = rw_cres
-        else:
-            cres = norw_cres
-        return cres
-
+    if debug:
+        flags.error_model = 'python'
     else:
-        pipeline = pipeline_class(typingctx, targetctx, library,
-                                  args, return_type, flags, locals)
-        return pipeline.compile_ir(func_ir=func_ir, lifted=lifted,
-                                   lifted_from=lifted_from)
+        flags.error_model = 'numpy'
+
+    if inline:
+        flags.forceinline = True
+    if fastmath:
+        flags.fastmath = True
+    if nvvm_options:
+        flags.nvvm_options = nvvm_options
+    flags.compute_capability = cc
+
+    # Run compilation pipeline
+    from numba.core.target_extension import target_override
+    with target_override('cuda'):
+        cres = compiler.compile_extra(typingctx=typingctx,
+                                      targetctx=targetctx,
+                                      func=pyfunc,
+                                      args=args,
+                                      return_type=return_type,
+                                      flags=flags,
+                                      locals={},
+                                      pipeline_class=CUDACompiler)
+
+    library = cres.library
+    library.finalize()
+
+    return cres
 
 
-def compile_internal(typingctx, targetctx, library,
-                     func, args, return_type, flags, locals):
+def cabi_wrap_function(context, lib, fndesc, wrapper_function_name,
+                       nvvm_options):
     """
-    For internal use only.
+    Wrap a Numba ABI function in a C ABI wrapper at the NVVM IR level.
+
+    The C ABI wrapper will have the same name as the source Python function.
     """
-    pipeline = Compiler(typingctx, targetctx, library,
-                        args, return_type, flags, locals)
-    return pipeline.compile_extra(func)
+    # The wrapper will be contained in a new library that links to the wrapped
+    # function's library
+    library = lib.codegen.create_library(f'{lib.name}_function_',
+                                         entry_name=wrapper_function_name,
+                                         nvvm_options=nvvm_options)
+    library.add_linking_library(lib)
+
+    # Determine the caller (C ABI) and wrapper (Numba ABI) function types
+    argtypes = fndesc.argtypes
+    restype = fndesc.restype
+    c_call_conv = CUDACABICallConv(context)
+    wrapfnty = c_call_conv.get_function_type(restype, argtypes)
+    fnty = context.call_conv.get_function_type(fndesc.restype, argtypes)
+
+    # Create a new module and declare the callee
+    wrapper_module = context.create_module("cuda.cabi.wrapper")
+    func = ir.Function(wrapper_module, fnty, fndesc.llvm_func_name)
+
+    # Define the caller - populate it with a call to the callee and return
+    # its return value
+
+    wrapfn = ir.Function(wrapper_module, wrapfnty, wrapper_function_name)
+    builder = ir.IRBuilder(wrapfn.append_basic_block(''))
+
+    arginfo = context.get_arg_packer(argtypes)
+    callargs = arginfo.from_arguments(builder, wrapfn.args)
+    # We get (status, return_value), but we ignore the status since we
+    # can't propagate it through the C ABI anyway
+    _, return_value = context.call_conv.call_function(
+        builder, func, restype, argtypes, callargs)
+    builder.ret(return_value)
+
+    library.add_ir_module(wrapper_module)
+    library.finalize()
+    return library
+
+
+@global_compiler_lock
+def compile(pyfunc, sig, debug=False, lineinfo=False, device=True,
+            fastmath=False, cc=None, opt=True, abi="c", abi_info=None,
+            output='ptx'):
+    """Compile a Python function to PTX or LTO-IR for a given set of argument
+    types.
+
+    :param pyfunc: The Python function to compile.
+    :param sig: The signature representing the function's input and output
+                types. If this is a tuple of argument types without a return
+                type, the inferred return type is returned by this function. If
+                a signature including a return type is passed, the compiled code
+                will include a cast from the inferred return type to the
+                specified return type, and this function will return the
+                specified return type.
+    :param debug: Whether to include debug info in the compiled code.
+    :type debug: bool
+    :param lineinfo: Whether to include a line mapping from the compiled code
+                     to the source code. Usually this is used with optimized
+                     code (since debug mode would automatically include this),
+                     so we want debug info in the LLVM IR but only the line
+                     mapping in the final output.
+    :type lineinfo: bool
+    :param device: Whether to compile a device function.
+    :type device: bool
+    :param fastmath: Whether to enable fast math flags (ftz=1, prec_sqrt=0,
+                     prec_div=, and fma=1)
+    :type fastmath: bool
+    :param cc: Compute capability to compile for, as a tuple
+               ``(MAJOR, MINOR)``. Defaults to ``(5, 0)``.
+    :type cc: tuple
+    :param opt: Enable optimizations. Defaults to ``True``.
+    :type opt: bool
+    :param abi: The ABI for a compiled function - either ``"numba"`` or
+                ``"c"``. Note that the Numba ABI is not considered stable.
+                The C ABI is only supported for device functions at present.
+    :type abi: str
+    :param abi_info: A dict of ABI-specific options. The ``"c"`` ABI supports
+                     one option, ``"abi_name"``, for providing the wrapper
+                     function's name. The ``"numba"`` ABI has no options.
+    :type abi_info: dict
+    :param output: Type of output to generate, either ``"ptx"`` or ``"ltoir"``.
+    :type output: str
+    :return: (code, resty): The compiled code and inferred return type
+    :rtype: tuple
+    """
+    if abi not in ("numba", "c"):
+        raise NotImplementedError(f'Unsupported ABI: {abi}')
+
+    if abi == 'c' and not device:
+        raise NotImplementedError('The C ABI is not supported for kernels')
+
+    if output not in ("ptx", "ltoir"):
+        raise NotImplementedError(f'Unsupported output type: {output}')
+
+    if debug and opt:
+        msg = ("debug=True with opt=True (the default) "
+               "is not supported by CUDA. This may result in a crash"
+               " - set debug=False or opt=False.")
+        warn(NumbaInvalidConfigWarning(msg))
+
+    lto = (output == 'ltoir')
+    abi_info = abi_info or dict()
+
+    nvvm_options = {
+        'fastmath': fastmath,
+        'opt': 3 if opt else 0
+    }
+
+    if lto:
+        nvvm_options['gen-lto'] = None
+
+    args, return_type = sigutils.normalize_signature(sig)
+
+    cc = cc or config.CUDA_DEFAULT_PTX_CC
+    cres = compile_cuda(pyfunc, return_type, args, debug=debug,
+                        lineinfo=lineinfo, fastmath=fastmath,
+                        nvvm_options=nvvm_options, cc=cc)
+    resty = cres.signature.return_type
+
+    if resty and not device and resty != types.void:
+        raise TypeError("CUDA kernel must have void return type.")
+
+    tgt = cres.target_context
+
+    if device:
+        lib = cres.library
+        if abi == "c":
+            wrapper_name = abi_info.get('abi_name', pyfunc.__name__)
+            lib = cabi_wrap_function(tgt, lib, cres.fndesc, wrapper_name,
+                                     nvvm_options)
+    else:
+        code = pyfunc.__code__
+        filename = code.co_filename
+        linenum = code.co_firstlineno
+
+        lib, kernel = tgt.prepare_cuda_kernel(cres.library, cres.fndesc, debug,
+                                              lineinfo, nvvm_options, filename,
+                                              linenum)
+
+    if lto:
+        code = lib.get_ltoir(cc=cc)
+    else:
+        code = lib.get_asm_str(cc=cc)
+    return code, resty
+
+
+def compile_for_current_device(pyfunc, sig, debug=False, lineinfo=False,
+                               device=True, fastmath=False, opt=True,
+                               abi="c", abi_info=None, output='ptx'):
+    """Compile a Python function to PTX or LTO-IR for a given signature for the
+    current device's compute capabilility. This calls :func:`compile` with an
+    appropriate ``cc`` value for the current device."""
+    cc = get_current_device().compute_capability
+    return compile(pyfunc, sig, debug=debug, lineinfo=lineinfo, device=device,
+                   fastmath=fastmath, cc=cc, opt=opt, abi=abi,
+                   abi_info=abi_info, output=output)
+
+
+def compile_ptx(pyfunc, sig, debug=False, lineinfo=False, device=False,
+                fastmath=False, cc=None, opt=True, abi="numba", abi_info=None):
+    """Compile a Python function to PTX for a given signature. See
+    :func:`compile`. The defaults for this function are to compile a kernel
+    with the Numba ABI, rather than :func:`compile`'s default of compiling a
+    device function with the C ABI."""
+    return compile(pyfunc, sig, debug=debug, lineinfo=lineinfo, device=device,
+                   fastmath=fastmath, cc=cc, opt=opt, abi=abi,
+                   abi_info=abi_info, output='ptx')
+
+
+def compile_ptx_for_current_device(pyfunc, sig, debug=False, lineinfo=False,
+                                   device=False, fastmath=False, opt=True,
+                                   abi="numba", abi_info=None):
+    """Compile a Python function to PTX for a given signature for the current
+    device's compute capabilility. See :func:`compile_ptx`."""
+    cc = get_current_device().compute_capability
+    return compile_ptx(pyfunc, sig, debug=debug, lineinfo=lineinfo,
+                       device=device, fastmath=fastmath, cc=cc, opt=opt,
+                       abi=abi, abi_info=abi_info)
+
+
+def declare_device_function(name, restype, argtypes):
+    return declare_device_function_template(name, restype, argtypes).key
+
+
+def declare_device_function_template(name, restype, argtypes):
+    from .descriptor import cuda_target
+    typingctx = cuda_target.typing_context
+    targetctx = cuda_target.target_context
+    sig = typing.signature(restype, *argtypes)
+    extfn = ExternFunction(name, sig)
+
+    class device_function_template(ConcreteTemplate):
+        key = extfn
+        cases = [sig]
+
+    fndesc = funcdesc.ExternalFunctionDescriptor(
+        name=name, restype=restype, argtypes=argtypes)
+    typingctx.insert_user_function(extfn, device_function_template)
+    targetctx.insert_user_function(extfn, fndesc)
+
+    return device_function_template
+
+
+class ExternFunction(object):
+    def __init__(self, name, sig):
+        self.name = name
+        self.sig = sig
