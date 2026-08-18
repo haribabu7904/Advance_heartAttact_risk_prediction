@@ -1,6 +1,5 @@
-"""Expose Numba command via ``python -m numba``."""
-import sys
-from numba.misc.numba_entry import main
+# See:
+# https://web.archive.org/web/20140822061353/http://cens.ioc.ee/projects/f2py2e
+from numpy.f2py.f2py2e import main
 
-if __name__ == '__main__':
-    sys.exit(main())
+main()
